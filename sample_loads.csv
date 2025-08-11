@@ -1,0 +1,6 @@
+Load ID,Source,Pickup Zip,Pickup City,Delivery City,Delivery Zip,Miles,Rate,Equip,Tarp,When,Broker,Broker Email,Broker Phone,Needs Review
+TS-884211,Truckstop,36602,"Mobile, AL","Atlanta, GA",30301,345,1300,Flat,False,2025-08-05 13:00,ABC Logistics,broker1@example.com,555-123-4567,False
+EM-40219,Email,36532,"Fairhope, AL","Savannah, GA",31401,420,1600,Flat,True,2025-08-05 15:30,Sherwood,dispatch@sherwoodlumber.com,413-289-7013,True
+INT-90012,McLeod,39201,"Jackson, MS","New Iberia, LA",70560,312,1250,Flat,False,2025-08-05 10:30,Southern Freight,loads@southernfreight.com,555-777-8888,False
+TS-884355,Truckstop,35203,"Birmingham, AL","Savannah, GA",31401,360,1500,Flat,False,2025-08-05 12:00,XYZ Freight,broker2@example.com,555-987-6543,True
+TS-900999,Truckstop,32501,"Pensacola, FL","Montgomery, AL",36104,169,900,Step,False,2025-08-05 11:30,Delta Carriers,broker3@example.com,555-654-3210,False
