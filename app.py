@@ -1,5 +1,6 @@
-import streamlit as st
+import streamlit as st 
 import pandas as pd
+import numpy as np
 import pydeck as pdk
 import math
 import re
@@ -12,7 +13,7 @@ import hashlib
 # CONFIGURATION
 # ---------------------------
 st.set_page_config(page_title="BBE Load Match", layout="wide")
-st.title("🚛 BBE Load Match (v7 – Enhanced UI & Features)")
+st.title("🚛 BBE Load Match (v7.1 – Faster Distance, Real Auto-Expand, Profit)")
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +30,10 @@ st.sidebar.header("Settings")
 load_source = st.sidebar.radio("Loads Source", ["Use sample", "Upload CSV"], index=0, key="load_source")
 uploaded_loads = st.sidebar.file_uploader("Upload Loads CSV", type="csv", key="loads_csv") if load_source == "Upload CSV" else None
 view_mode = st.sidebar.radio("View", ["Single Truck", "Multi-Truck"], index=0, key="view_mode")
+cost_per_mile = st.sidebar.number_input("Cost per mile (est.)", min_value=0.0, value=1.50, step=0.05)
+with st.sidebar.expander("Advanced Search", expanded=False):
+    exp_step = st.slider("Auto-expand step (mi)", 25, 150, 50, step=25)
+    exp_ceiling = st.slider("Auto-expand ceiling (mi)", 100, 500, 300, step=25)
 
 # ---------------------------
 # UTILITIES
@@ -36,14 +41,6 @@ view_mode = st.sidebar.radio("View", ["Single Truck", "Multi-Truck"], index=0, k
 @st.cache_data(ttl=300)  # Refresh every 5 minutes
 def read_csv(file_or_path, **kwargs):
     return pd.read_csv(file_or_path, **kwargs)
-
-def haversine(lat1, lon1, lat2, lon2):
-    R = 3959.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    return 2 * R * math.asin(min(1, math.sqrt(a)))
 
 def first_col(df: pd.DataFrame, *candidates):
     lower = {c.lower(): c for c in df.columns}
@@ -56,6 +53,7 @@ def first_col(df: pd.DataFrame, *candidates):
 # ZIP DB (lazy loading)
 # ---------------------------
 _zip = None
+@st.cache_data(ttl=3600)
 def get_zip_db():
     global _zip
     if _zip is None:
@@ -101,7 +99,7 @@ def find_zip_info(zip_code: str):
 # ---------------------------
 @st.cache_data
 def normalize_loads(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or not any(col in df.columns for col in ["Pickup", "Drop", "Rate", "Miles"]):
+    if df is None or df.empty or not any(col.lower() in [c.lower() for c in df.columns] for col in ["Pickup", "Drop", "Rate", "Miles"]):
         st.error("Loads CSV must contain at least Pickup, Drop, Rate, and Miles columns.")
         return pd.DataFrame(columns=["Equipment", "DestLat", "DestLon", "Rate", "Miles", "Pickup", "Drop", "Broker", "BrokerEmail", "BrokerPhone", "DropZip"])
     d = df.copy()
@@ -111,9 +109,21 @@ def normalize_loads(df: pd.DataFrame) -> pd.DataFrame:
     equip_col = first_col(d, "equipment", "equip", "trailer", "trailertype", "type")
     d["Equipment"] = d[equip_col].astype(str).str.strip() if equip_col else "Flat"
 
-    # Rate (USD)
+    # Rate (USD - parse total $)
     rate_col = first_col(d, "rate", "price", "pay", "freight", "offer")
-    d["Rate"] = pd.to_numeric(d[rate_col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce") if rate_col else pd.NA
+    if rate_col:
+        parsed = (
+            d[rate_col]
+            .astype(str)
+            .str.lower()
+            .str.replace(",", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.replace("k", "000", regex=False)
+            .str.extract(r"(-?\d+\.?\d*)")[0]
+        )
+        d["Rate"] = pd.to_numeric(parsed, errors="coerce")
+    else:
+        d["Rate"] = pd.NA
 
     # Miles (loaded)
     miles_col = first_col(d, "miles", "distance", "loaded_miles", "mi")
@@ -130,6 +140,8 @@ def normalize_loads(df: pd.DataFrame) -> pd.DataFrame:
     d["Drop"] = d[[c for c in [drop_city] if c]].astype(str).agg(", ".join, axis=1) if drop_city else ""
     if drop_state:
         d["Drop"] = (d["Drop"] + ", " + d[drop_state].astype(str)).str.strip(", ")
+    d["Pickup"] = d["Pickup"].replace(["nan","None"], "", regex=False)
+    d["Drop"] = d["Drop"].replace(["nan","None"], "", regex=False)
 
     # Broker info
     broker_col = first_col(d, "broker", "company", "contact", "provider")
@@ -164,6 +176,7 @@ def normalize_loads(df: pd.DataFrame) -> pd.DataFrame:
 
     return d
 
+# Load data
 try:
     raw_loads = read_csv(uploaded_loads) if uploaded_loads is not None else read_csv("sample_loads.csv")
     loads_df = normalize_loads(raw_loads)
@@ -173,23 +186,47 @@ except Exception as e:
 equip_options = sorted({str(x) for x in loads_df.get("Equipment", pd.Series(["Flat"])).dropna().unique()}) or ["Flat", "Step"]
 
 # ---------------------------
-# MATCHING LOGIC
+# Matching helpers
 # ---------------------------
+def haversine_vec(lat1, lon1, lat2, lon2):
+    R = 3959.0
+    lat1 = np.radians(lat1); lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2); lon2 = np.radians(lon2)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
+    return 2 * R * np.arcsin(np.minimum(1, np.sqrt(a)))
+
 def compute_deadhead_rows(df: pd.DataFrame, t_lat: float, t_lon: float) -> pd.DataFrame:
     subset = df.dropna(subset=["DestLat", "DestLon"]).copy()
     if subset.empty:
         return subset
-    subset["Deadhead"] = subset.apply(
-        lambda r: haversine(t_lat, t_lon, float(r["DestLat"]), float(r["DestLon"])),
-        axis=1
+    subset["Deadhead"] = haversine_vec(
+        t_lat, t_lon,
+        subset["DestLat"].astype(float).values,
+        subset["DestLon"].astype(float).values
     )
+    # RPM (if Rate is total $)
     if "Rate" in subset.columns and "Miles" in subset.columns:
-        subset["RPM"] = (pd.to_numeric(subset["Rate"], errors="coerce") /
-                         pd.to_numeric(subset["Miles"], errors="coerce")).round(2)
-        subset["Profit"] = (subset["Rate"] * subset["Miles"]) - (subset["Deadhead"] * 1.5)
+        rate_num = pd.to_numeric(subset["Rate"], errors="coerce")
+        miles_num = pd.to_numeric(subset["Miles"], errors="coerce")
+        subset["RPM"] = (rate_num / miles_num.replace(0, np.nan)).round(2)
     return subset
 
-def match_loads(loads_df: pd.DataFrame, truck_zip: str, equipment: str, max_deadhead: int, auto_expand: bool):
+def add_profit(df: pd.DataFrame, cpm: float) -> pd.DataFrame:
+    if df.empty:
+        return df
+    rate_num = pd.to_numeric(df["Rate"], errors="coerce")
+    miles_num = pd.to_numeric(df["Miles"], errors="coerce")
+    deadhead_num = pd.to_numeric(df["Deadhead"], errors="coerce")
+    total_miles = (miles_num.fillna(0) + deadhead_num.fillna(0))
+    est_cost = cpm * total_miles
+    df["Profit"] = (rate_num.fillna(0) - est_cost).round(0)
+    return df
+
+def match_loads(loads_df: pd.DataFrame, truck_zip: str, equipment: str,
+                max_deadhead: int, auto_expand: bool,
+                step: int = 50, ceiling: int = 300):
     truck_zip = re.sub(r'[^0-9]', '', str(truck_zip))[:5]
     info = find_zip_info(truck_zip)
     if not info:
@@ -197,18 +234,35 @@ def match_loads(loads_df: pd.DataFrame, truck_zip: str, equipment: str, max_dead
         info = (30.6954, -88.0399, "Mobile", "AL")
     t_lat, t_lon, t_city, t_state = info
 
+    # Filter by equipment (if present)
     subset = loads_df.copy()
     if "Equipment" in subset.columns:
         subset = subset[subset["Equipment"].astype(str).str.lower() == str(equipment).lower()]
+
+    # Distance + profit
     subset = compute_deadhead_rows(subset, t_lat, t_lon)
+    subset = add_profit(subset, cost_per_mile)
+
     if subset.empty:
         return pd.DataFrame(), max_deadhead, (t_lat, t_lon)
 
-    hits = subset[subset["Deadhead"] <= max_deadhead].sort_values("Deadhead")
-    if not hits.empty:
-        trusted_brokers = read_csv("brokers.csv")["Broker"].tolist() if os.path.exists("brokers.csv") else []
-        hits = hits[hits["Broker"].isin(trusted_brokers)] if trusted_brokers else hits
-    return hits, max_deadhead, (t_lat, t_lon)
+    radius = max_deadhead
+    while True:
+        hits = subset[subset["Deadhead"] <= radius].sort_values(["Deadhead", "Profit"], ascending=[True, False])
+        # Optional trusted brokers filter only if file non-empty
+        if not hits.empty and os.path.exists("brokers.csv"):
+            try:
+                trusted = read_csv("brokers.csv")
+                if "Broker" in trusted.columns:
+                    brokers_clean = trusted["Broker"].dropna().astype(str).unique()
+                    if brokers_clean.size > 0:
+                        hits = hits[hits["Broker"].astype(str).isin(brokers_clean)]
+            except Exception:
+                pass
+
+        if not hits.empty or not auto_expand or radius >= ceiling:
+            return hits, radius, (t_lat, t_lon)
+        radius += step
 
 # ---------------------------
 # RENDERING
@@ -218,8 +272,9 @@ def render_map(truck_latlon, rows: pd.DataFrame):
         return
     tlat, tlon = truck_latlon
     layers = []
-    if not rows.empty:
-        drop = rows.dropna(subset=["DestLat", "DestLon"]).head(20).copy()
+
+    if not rows.empty and {"DestLat","DestLon"}.issubset(rows.columns):
+        drop = rows.dropna(subset=["DestLat", "DestLon"]).head(200).copy()
         if not drop.empty:
             drop["lat"] = drop["DestLat"].astype(float)
             drop["lon"] = drop["DestLon"].astype(float)
@@ -231,9 +286,9 @@ def render_map(truck_latlon, rows: pd.DataFrame):
                     get_fill_color=[0, 122, 255, 160],
                     get_radius=6000,
                     pickable=True,
-                    tooltip={"html": "<b>Drop Location</b><br>Load: {Pickup} → {Drop}<br>Rate: ${Rate}<br>Miles: {Miles}"}
                 )
             )
+
     truck_df = pd.DataFrame([{"lat": tlat, "lon": tlon}])
     layers.append(
         pdk.Layer(
@@ -243,21 +298,21 @@ def render_map(truck_latlon, rows: pd.DataFrame):
             get_fill_color=[255, 0, 0, 200],
             get_radius=7000,
             pickable=True,
-            tooltip={"html": "<b>Truck Location</b>"}
         )
     )
+
     deck = pdk.Deck(
         map_style=MAP_STYLE,
         initial_view_state=pdk.ViewState(latitude=tlat, longitude=tlon, zoom=6),
-        layers=layers
+        layers=layers,
+        tooltip={"html": "<b>{Pickup}</b> → <b>{Drop}</b><br>Rate: ${Rate}<br>Miles: {Miles}<br>Deadhead: {Deadhead}"}
     )
     st.pydeck_chart(deck, use_container_width=True)
 
-def load_card(row, i):
-    key = f"booked_{i}"
-    if key not in st.session_state:
-        st.session_state[key] = False
-    booked = st.session_state[key]
+def load_card(row):
+    load_id = str(row.get("Load ID", f"{row.get('Pickup','?')}-{row.get('Drop','?')}-{row.get('Rate','?')}"))
+    key = f"booked_{hashlib.md5(load_id.encode()).hexdigest()[:8]}"
+    booked = st.session_state.get(key, False)
 
     rate = row.get("Rate", "")
     miles = row.get("Miles", "")
@@ -265,7 +320,7 @@ def load_card(row, i):
     profit = row.get("Profit", 0)
     pickup = row.get("Pickup", "")
     drop = row.get("Drop", "")
-    broker = row.get("Broker", "")
+    broker = str(row.get("Broker", "") or "")
     b_email = str(row.get("BrokerEmail", "") or "")
     b_phone = str(row.get("BrokerPhone", "") or "")
 
@@ -273,26 +328,28 @@ def load_card(row, i):
 
     with c1:
         st.markdown(f"**{pickup or 'Origin ?'} → {drop or 'Destination ?'}**")
-        st.caption(f"Equip: {row.get('Equipment', '?')} • Deadhead: {round(row.get('Deadhead', 0), 1)} mi")
+        st.caption(f"Equip: {row.get('Equipment', '?')} • Deadhead: {round(float(row.get('Deadhead', 0) or 0), 1)} mi")
 
     with c2:
-        st.metric("Rate", f"${int(rate):,}" if pd.notna(rate) else "—")
-        st.metric("Profit", f"${int(profit):,}" if pd.notna(profit) else "—")
+        st.metric("Rate", f"${int(rate):,}" if pd.notna(rate) and rate != "" else "—")
+        st.metric("Profit", f"${int(profit):,}" if pd.notna(profit) and profit != "" else "—")
 
     with c3:
-        st.metric("Miles", f"{int(miles):,}" if pd.notna(miles) else "—")
-        st.metric("RPM", f"{rpm:.2f}" if pd.notna(rpm) else "—")
+        st.metric("Miles", f"{int(miles):,}" if pd.notna(miles) and miles != "" else "—")
+        try:
+            st.metric("RPM", f"{float(rpm):.2f}" if pd.notna(rpm) and rpm != "" else "—")
+        except Exception:
+            st.metric("RPM", "—")
 
     with c4:
         subject = f"BBE Interest in Load - {pickup} to {drop}"
         body = f"Hello {broker or ''},%0D%0A%0D%0AWe are interested in this load for a nearby truck.%0D%0AThanks,%0D%0ABBE"
         st.markdown(
-            f"[📧 Email](mailto:{b_email if booked else '***@***'}?subject={subject}&body={body}) &nbsp;&nbsp; "
+            f"[📧 Email](mailto:{b_email}?subject={subject}&body={body}) &nbsp;&nbsp; "
             f"[📞 Call](tel:{b_phone})",
             unsafe_allow_html=True
         )
-        clicked = st.toggle("Booked", value=booked, key=key)
-        st.session_state[key] = clicked
+        st.session_state[key] = st.toggle("Booked", value=booked, key=key)
 
     st.divider()
 
@@ -313,20 +370,30 @@ if view_mode == "Single Truck":
         pickup_date = st.date_input("Pickup Date", value=datetime.now(), key="pickup_date")
 
     if st.button("Find Loads", key="find_loads"):
-        results, used_radius, truck_latlon = match_loads(loads_df, truck_zip, equipment, max_deadhead, auto_expand)
+        results, used_radius, truck_latlon = match_loads(loads_df, truck_zip, equipment, max_deadhead, auto_expand, step=exp_step, ceiling=exp_ceiling)
         if results.empty:
             st.warning(f"No loads found within {used_radius} miles.")
         else:
             st.success(f"Found {len(results)} load(s) within {used_radius} miles.")
             with st.expander("Map (truck and drops)", expanded=False):
                 render_map(truck_latlon, results)
-            for i, (_, r) in enumerate(results.head(25).iterrows()):
-                load_card(r, i)
-            if st.button("Download Matches", key="download"):
-                csv = results.to_csv(index=False)
-                st.download_button("Download CSV", csv, "matches.csv", "text/csv")
+            for _, r in results.head(50).iterrows():
+                load_card(r)
+
+            # Direct download
+            st.download_button(
+                "⬇️ Download Matches (CSV)",
+                data=results.to_csv(index=False).encode("utf-8"),
+                file_name="matches.csv",
+                mime="text/csv",
+            )
+
+            st.caption("Tip: adjust Cost per mile and Auto-expand settings in the sidebar to tune results.")
             if st.button("Refresh Loads", key="refresh"):
-                st.experimental_rerun()
+                try:
+                    st.rerun()
+                except Exception:
+                    st.experimental_rerun()
 
 else:
     st.subheader("Multi-Truck Search")
@@ -346,7 +413,7 @@ else:
                 for _, tr in tdf.iterrows():
                     tz = str(tr.get(zip_col, "")).strip()
                     eq = str(tr.get(equip_col, equip_options[0]))
-                    hits, used_radius, _ = match_loads(loads_df, tz, eq, 100, True)
+                    hits, used_radius, _ = match_loads(loads_df, tz, eq, 100, True, step=exp_step, ceiling=exp_ceiling)
                     if not hits.empty:
                         hits = hits.head(int(top_n)).copy()
                         hits.insert(0, "TruckZIP", tz)
@@ -354,10 +421,13 @@ else:
                         all_rows.append(hits)
                 if all_rows:
                     final_df = pd.concat(all_rows, ignore_index=True)
-                    st.dataframe(final_df)
-                    if st.button("Download All Matches", key="download_multi"):
-                        csv = final_df.to_csv(index=False)
-                        st.download_button("Download CSV", csv, "multi_matches.csv", "text/csv")
+                    st.dataframe(final_df, use_container_width=True)
+                    st.download_button(
+                        "⬇️ Download All Matches (CSV)",
+                        data=final_df.to_csv(index=False).encode("utf-8"),
+                        file_name="multi_matches.csv",
+                        mime="text/csv",
+                    )
                 else:
                     st.warning("No matches found for uploaded trucks.")
         except Exception as e:
@@ -368,6 +438,6 @@ else:
 # ---------------------------
 with st.sidebar.expander("Diagnostics"):
     st.write("loads_df columns:", list(loads_df.columns))
-    st.write("equip options:", equip_options[:10])
+    st.write("equip options:", equip_options[:10] if isinstance(equip_options, list) else equip_options)
     if "Rate" in loads_df.columns:
         st.write("Sample Rates:", loads_df["Rate"].head().tolist())
