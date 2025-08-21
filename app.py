@@ -312,7 +312,7 @@ def load_card(row):
         with cta2:
             st.markdown(f"[📞 Call Broker](tel:{b_phone})", unsafe_allow_html=True)
         with cta3:
-            st.session_state[key] = st.toggle("Booked", value=booked, key=key)
+            booked = st.toggle("Booked", value=booked, key=key)
         st.markdown('</div>', unsafe_allow_html=True)
 
 def render_map(truck_latlon, rows: pd.DataFrame):
