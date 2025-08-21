@@ -1,4 +1,4 @@
-# app.py — BBE Load Match PRO (v7.2 – Polished UI)
+# app.py — BBE Load Match PRO (v7.2 – Polished UI, fixed normalize_loads)
 
 import sys, traceback
 try:
@@ -25,13 +25,10 @@ st.set_page_config(
 # subtle UI polish (safe, local CSS)
 st.markdown("""
 <style>
-/* reduce top padding */
 .block-container {padding-top: 1.2rem;}
-/* pill-like badges */
 .badge {display:inline-block; padding:3px 10px; border-radius:999px; font-size:11px; background:#eef2ff; color:#1e40af; font-weight:600;}
 .badge-green {background:#ecfdf5; color:#065f46;}
 .badge-amber {background:#fffbeb; color:#92400e;}
-/* card feel */
 .load-card {border:1px solid #e5e7eb; border-radius:16px; padding:14px 16px; margin-bottom:10px; background:#fff; box-shadow:0 1px 0 rgba(0,0,0,0.03);}
 .load-title {font-weight:700; font-size:16px; margin:0;}
 .load-sub {color:#6b7280; font-size:12px;}
@@ -42,14 +39,11 @@ hr {border:none; height:1px; background:#f3f4f6; margin:8px 0;}
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# HEADER
+# HEADER / LOGGING
 # -----------------------------------------------------------------------------
 st.markdown("### 🚛 BBE Load Match **PRO**")
 st.caption("Find reloads fast. Prioritize profit. Keep deadhead tight.")
 
-# -----------------------------------------------------------------------------
-# LOGGING
-# -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -102,12 +96,11 @@ def get_zip_db():
     try:
         z = read_csv("zip_db.csv")
         z = z.rename(columns={c: c.strip().upper() for c in z.columns})
-        # Normalize long/lng
         if "LONG" in z.columns and "LNG" not in z.columns: z["LNG"] = z["LONG"]
         if "LON" in z.columns and "LNG" not in z.columns: z["LNG"] = z["LON"]
-        for c in ("ZIP","LAT","LNG"):
-            if c not in z.columns:
-                st.warning("zip_db.csv requires ZIP, LAT, LNG."); break
+        need = {"ZIP","LAT","LNG"}
+        if not need.issubset(z.columns):
+            st.warning("zip_db.csv requires ZIP, LAT, LNG.")
         z["ZIP"] = pd.to_numeric(z["ZIP"], errors="coerce").astype("Int64")
         z["LAT"] = pd.to_numeric(z["LAT"], errors="coerce")
         z["LNG"] = pd.to_numeric(z["LNG"], errors="coerce")
@@ -132,6 +125,9 @@ def find_zip_info(zip_code: str):
     if lat is None or lng is None: return None
     return (lat, lng, city, state)
 
+# -----------------------------------------------------------------------------
+# LOADS (robust normalization) — FIXED DropZip iteration
+# -----------------------------------------------------------------------------
 @st.cache_data
 def normalize_loads(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -174,21 +170,21 @@ def normalize_loads(df: pd.DataFrame) -> pd.DataFrame:
     drop_city = first_col(d, "drop_city","delivery_city","dest_city","to_city","drop")
     drop_state = first_col(d, "drop_state","delivery_state","dest_state","to_state","drop_st","dropstate")
     d["Pickup"] = d[[c for c in [pick_city] if c]].astype(str).agg(", ".join, axis=1) if pick_city else d.get("Pickup","")
-    d["Drop"] = d[[c for c in [drop_city] if c]].astype(str).agg(", ".join, axis=1) if drop_city else d.get("Drop","")
+    d["Drop"]   = d[[c for c in [drop_city] if c]].astype(str).agg(", ".join, axis=1) if drop_city else d.get("Drop","")
     if pick_state: d["Pickup"] = (d["Pickup"] + ", " + d[pick_state].astype(str)).str.strip(", ")
-    if drop_state: d["Drop"] = (d["Drop"] + ", " + d[drop_state].astype(str)).str.strip(", ")
+    if drop_state: d["Drop"]   = (d["Drop"] + ", " + d[drop_state].astype(str)).str.strip(", ")
     d["Pickup"] = d["Pickup"].replace(["nan","None"], "", regex=False)
-    d["Drop"] = d["Drop"].replace(["nan","None"], "", regex=False)
+    d["Drop"]   = d["Drop"].replace(["nan","None"], "", regex=False)
 
     # Broker info
     broker_col = first_col(d, "broker","company","contact","provider")
-    email_col = first_col(d, "broker_email","email","e-mail","mail")
-    phone_col = first_col(d, "broker_phone","phone","tel","telephone","cell")
-    d["Broker"] = d[broker_col].astype(str) if broker_col else ""
+    email_col  = first_col(d, "broker_email","email","e-mail","mail")
+    phone_col  = first_col(d, "broker_phone","phone","tel","telephone","cell")
+    d["Broker"]      = d[broker_col].astype(str) if broker_col else ""
     d["BrokerEmail"] = d[email_col].astype(str) if email_col else ""
     d["BrokerPhone"] = d[phone_col].astype(str) if phone_col else ""
 
-    # Dest lat/lon
+    # Destination Lat/Lon
     lat_col = first_col(d, "destlat","drop_lat","droplat","delivery_lat","dlat","lat2")
     lon_col = first_col(d, "destlon","drop_lon","droplon","delivery_lon","dlon","lng2","lon2")
     if lat_col and lon_col:
@@ -197,13 +193,16 @@ def normalize_loads(df: pd.DataFrame) -> pd.DataFrame:
     else:
         zip_col = first_col(d, "drop_zip","dest_zip","delivery_zip","to_zip","zip_to","dropzip","zip")
         d["DropZip"] = d[zip_col].astype(str) if zip_col else ""
+        # ✅ FIX: never use a Series in a boolean context; iterate safely
+        ser = d["DropZip"] if "DropZip" in d.columns else pd.Series([], dtype="object")
+        ser = ser.astype(str).fillna("")
         lat, lon = [], []
-        for z in (d.get("DropZip") or []):
-            info = find_zip_info(z) if str(z).strip() else None
-            a,b = (info[0],info[1]) if info else (None,None)
+        for z in ser:
+            info = find_zip_info(z) if z.strip() else None
+            a, b = (info[0], info[1]) if info else (None, None)
             lat.append(a); lon.append(b)
-        d["DestLat"] = lat if lat else pd.NA
-        d["DestLon"] = lon if lon else pd.NA
+        d["DestLat"] = lat if len(lat) == len(d) else pd.NA
+        d["DestLon"] = lon if len(lon) == len(d) else pd.NA
 
     return d
 
@@ -250,11 +249,7 @@ def se_lane_boost(city_state: str) -> int:
 def rank_results(df: pd.DataFrame, prefer_se: bool) -> pd.DataFrame:
     if df.empty: return df
     out = df.copy()
-    if prefer_se:
-        out["SEBoost"] = out["Drop"].astype(str).apply(se_lane_boost)
-    else:
-        out["SEBoost"] = 0
-    # Sort by: Profit desc, Deadhead asc, SE boost desc
+    out["SEBoost"] = out["Drop"].astype(str).apply(se_lane_boost) if prefer_se else 0
     return out.sort_values(by=["SEBoost","Profit","Deadhead"], ascending=[False, False, True])
 
 def load_source_df(uploaded_file):
@@ -365,6 +360,14 @@ def render_map(truck_latlon, rows: pd.DataFrame):
 # -----------------------------------------------------------------------------
 # DATA LOAD
 # -----------------------------------------------------------------------------
+def load_source_df(uploaded_file):
+    if uploaded_file is not None:
+        return read_csv(uploaded_file)
+    try:
+        return read_csv("sample_loads.csv")
+    except Exception:
+        return pd.DataFrame()
+
 if source == "Upload CSV" and uploaded_loads is not None:
     raw_loads = load_source_df(uploaded_loads)
 else:
@@ -402,14 +405,12 @@ if view_mode == "Single Truck":
         if "Equipment" in subset.columns:
             subset = subset[subset["Equipment"].astype(str).str.lower() == equipment.lower()]
 
-        # compute derived fields
         subset = compute_deadhead_rows(subset, t_lat, t_lon)
         subset = add_profit(subset, cost_per_mile)
 
         if subset.empty:
             st.warning("No loads data available.")
         else:
-            # auto-expand radius search
             used = start_radius
             hits = pd.DataFrame()
             while True:
@@ -423,15 +424,13 @@ if view_mode == "Single Truck":
             else:
                 ranked = rank_results(hits, prefer_se)
 
-                # Tabs: Results / Map / Diagnostics
                 t_results, t_map, t_diag = st.tabs(["📋 Results", "🗺️ Map", "🛠 Diagnostics"])
 
                 with t_results:
-                    # summary bar
                     colA, colB, colC, colD = st.columns(4)
                     colA.metric("Matches", len(ranked))
                     colB.metric("Radius Used", f"{used} mi")
-                    colC.metric("Median Profit", f"${int(ranked['Profit'].median()):,}")
+                    colC.metric("Median Profit", f"${int(ranked['Profit'].median()):,}" if not ranked['Profit'].empty else "—")
                     colD.metric("Median RPM", f"{ranked['RPM'].median():.2f}" if pd.notna(ranked['RPM']).any() else "—")
 
                     st.download_button(
@@ -443,7 +442,6 @@ if view_mode == "Single Truck":
                     )
 
                     st.markdown("—")
-                    # cards
                     for _, r in ranked.head(60).iterrows():
                         load_card(r)
 
@@ -486,7 +484,6 @@ else:
                     if sub.empty:
                         continue
 
-                    # expand out
                     used = 100
                     hits = pd.DataFrame()
                     while True:
@@ -514,6 +511,9 @@ else:
                     )
                 else:
                     st.warning("No matches found for uploaded trucks.")
+        except Exception as e:
+            st.error(f"Failed to process trucks CSV: {e}")
+
         except Exception as e:
             st.error(f"Failed to process trucks CSV: {e}")
 
