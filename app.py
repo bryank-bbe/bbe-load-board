@@ -1,4 +1,4 @@
-# app.py — BBE Load Match PRO (v7.2 – Polished UI, fixed normalize_loads)
+# app.py — BBE Load Match PRO (v7.2 – Polished UI, fixed normalize_loads + toggle key)
 
 import sys, traceback
 try:
@@ -22,7 +22,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# subtle UI polish (safe, local CSS)
 st.markdown("""
 <style>
 .block-container {padding-top: 1.2rem;}
@@ -59,9 +58,7 @@ MAP_STYLE = os.getenv("MAP_STYLE", "mapbox://styles/mapbox/light-v9")
 with st.sidebar:
     st.subheader("Settings")
     source = st.radio("Loads Source", ["Sample CSV", "Upload CSV"], index=0, horizontal=True)
-    uploaded_loads = None
-    if source == "Upload CSV":
-        uploaded_loads = st.file_uploader("Upload Loads CSV", type=["csv"])
+    uploaded_loads = st.file_uploader("Upload Loads CSV", type=["csv"]) if source == "Upload CSV" else None
 
     st.divider()
     st.subheader("Search Radius")
@@ -193,7 +190,7 @@ def normalize_loads(df: pd.DataFrame) -> pd.DataFrame:
     else:
         zip_col = first_col(d, "drop_zip","dest_zip","delivery_zip","to_zip","zip_to","dropzip","zip")
         d["DropZip"] = d[zip_col].astype(str) if zip_col else ""
-        # ✅ FIX: never use a Series in a boolean context; iterate safely
+        # SAFE iteration over Series (no boolean ambiguity)
         ser = d["DropZip"] if "DropZip" in d.columns else pd.Series([], dtype="object")
         ser = ser.astype(str).fillna("")
         lat, lon = [], []
@@ -264,6 +261,7 @@ def load_source_df(uploaded_file):
 # CARDS / MAP RENDER
 # -----------------------------------------------------------------------------
 def load_card(row):
+    # Stable unique key per load
     load_id = str(row.get("Load ID", f"{row.get('Pickup','?')}-{row.get('Drop','?')}-{row.get('Rate','?')}"))
     key = f"booked_{hashlib.md5(load_id.encode()).hexdigest()[:8]}"
     booked = st.session_state.get(key, False)
@@ -312,6 +310,7 @@ def load_card(row):
         with cta2:
             st.markdown(f"[📞 Call Broker](tel:{b_phone})", unsafe_allow_html=True)
         with cta3:
+            # ✅ Do not write to session_state with same key as widget
             booked = st.toggle("Booked", value=booked, key=key)
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -511,9 +510,6 @@ else:
                     )
                 else:
                     st.warning("No matches found for uploaded trucks.")
-        except Exception as e:
-            st.error(f"Failed to process trucks CSV: {e}")
-
         except Exception as e:
             st.error(f"Failed to process trucks CSV: {e}")
 
