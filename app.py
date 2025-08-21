@@ -1,6 +1,4 @@
-
-
-# app.py — BBE Load Match PRO (v7.2 – Polished UI, fixed normalize_loads + toggle key)
+# app.py — BBE Load Match PRO (v7.2 – polished UI + fixes)
 
 import sys, traceback
 try:
@@ -10,6 +8,7 @@ try:
     import pydeck as pdk
     import os, re, hashlib, logging
     from datetime import datetime
+    from urllib.parse import quote
 except Exception as e:
     print("STARTUP IMPORT ERROR:", e)
     traceback.print_exc()
@@ -303,17 +302,30 @@ def load_card(row):
             st.markdown(f'<div class="metric">{int(miles) if pd.notna(miles) and miles!="" else "—"} mi</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="kv">RPM: {rpm_txt}</div>', unsafe_allow_html=True)
 
+        # CTA row (render Markdown links, only when data exists)
         st.markdown("<hr/>", unsafe_allow_html=True)
         cta1, cta2, cta3 = st.columns([2,2,1])
+
+        subject = f"BBE Interest in Load - {pickup or ''} to {drop or ''}"
+        body_txt = f"Hello {broker or ''},\n\nWe are interested in this load for a nearby truck.\nThanks,\nBBE"
+        subject_enc = quote(subject)
+        body_enc = quote(body_txt)
+
         with cta1:
-            subject = f"BBE Interest in Load - {pickup} to {drop}"
-            body = f"Hello {broker or ''},%0D%0A%0D%0AWe are interested in this load for a nearby truck.%0D%0AThanks,%0D%0ABBE"
-            st.markdown(f"[📧 Email Broker](mailto:{b_email}?subject={subject}&body={body})", unsafe_allow_html=True)
+            if b_email and b_email.strip():
+                st.markdown(f"[📧 Email Broker](mailto:{b_email}?subject={subject_enc}&body={body_enc})")
+            else:
+                st.caption("📧 No broker email on this row")
+
         with cta2:
-            st.markdown(f"[📞 Call Broker](tel:{b_phone})", unsafe_allow_html=True)
+            if b_phone and b_phone.strip():
+                st.markdown(f"[📞 Call Broker](tel:{b_phone})")
+            else:
+                st.caption("📞 No broker phone on this row")
+
         with cta3:
-            # ✅ Do not write to session_state with same key as widget
             booked = st.toggle("Booked", value=booked, key=key)
+
         st.markdown('</div>', unsafe_allow_html=True)
 
 def render_map(truck_latlon, rows: pd.DataFrame):
@@ -514,4 +526,3 @@ else:
                     st.warning("No matches found for uploaded trucks.")
         except Exception as e:
             st.error(f"Failed to process trucks CSV: {e}")
-
